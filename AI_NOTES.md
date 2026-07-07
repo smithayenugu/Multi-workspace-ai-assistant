@@ -2,7 +2,7 @@
 
 ## AI tools used
 
-I used two AI coding agents across this build: **Cline** for the initial scaffolding and architecture (Node/Express backend, React/Vite frontend, Supabase/pgvector schema, the core RAG and tool-calling loops), and **Blackbox AI**, driven turn-by-turn in chat, for debugging and feature work once the app was running end-to-end. Cline had a standing system prompt (`ai-instructions/cline-initial-prompt.md`) specifying the stack and requirements up front. Blackbox AI had no standing prompt — that phase was me testing a feature in the browser, then telling it directly what was broken or what to build next; the real prompts from that session are the ones quoted below, not a paraphrased summary.
+I used three AI tools across this build: **Cline** for the initial scaffolding and architecture (Node/Express backend, React/Vite frontend, Supabase/pgvector schema, the core RAG and tool-calling loops), **Blackbox AI**, driven turn-by-turn in chat, for debugging and feature work once the app was running end-to-end, and **Claude**, later, for getting the app actually deployed and working through the issues that only showed up once it was live. Cline had a standing system prompt (`ai-instructions/cline-initial-prompt.md`) specifying the stack and requirements up front. Blackbox AI had no standing prompt — that phase was me testing a feature in the browser, then telling it directly what was broken or what to build next; the real prompts from that session are the ones quoted below, not a paraphrased summary. With Claude I mostly pasted real errors and logs as they came up and worked through each one until it was actually fixed.
 
 Roughly, I split it as: the agents wrote the routes, controllers, and boilerplate; I decided the architecture, ran every "should be fixed now" claim back through the actual app before accepting it, and pushed back when the first fix attempt wasn't good enough.
 
@@ -35,9 +35,14 @@ I don't know based on the uploaded documents. [5 sources cited]
 I don't know based on the uploaded documents. [still failing after fix #1]
 ```
 
+## Getting it actually deployed
+
+Deploying to Render (backend) and Vercel (frontend) surfaced a separate round of problems I hadn't hit locally — a build/start command mismatch, CORS between the two domains, and a ReferenceError in the document-processing code. Worked through all of it with Claude, pasting real errors and logs each time (details in CLAUDE.md). One issue from that pass is still open: a test document extracts fine but its status still ends up "Failed" instead of "Ready," and I haven't confirmed the root cause yet.
+
 ## What I'd improve with more time
 
 - Stress-test the relaxed grounding rule against the opposite failure mode — now that the model synthesizes from partial context, I want to confirm it still refuses cleanly on a workspace with genuinely nothing relevant, rather than over-correcting toward always answering.
 - Re-verify duplicate-upload idempotency end-to-end; it was added later in the process and deserves a dedicated re-test pass.
+- Actually resolve the post-extraction processing failure described above, rather than leaving it as a known issue.
 - Surface the observability data (latency, token counts, retrieval hit/miss) in the dashboard UI itself rather than only in the database.
 - Exercise multi-step tool use (one tool call informing a second) end-to-end rather than just at the code level.
