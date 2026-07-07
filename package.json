@@ -1,0 +1,17 @@
+{
+  "name": "multi-workspace-document-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Multi-Workspace AI Document Assistant with RAG and Tool Calling",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:frontend\"",
+    "dev:server": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "start": "cd backend && npm start"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
