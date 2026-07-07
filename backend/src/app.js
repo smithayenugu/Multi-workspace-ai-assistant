@@ -7,7 +7,6 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const path = require('path');
 const config = require('./config');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 
@@ -33,7 +32,10 @@ app.use(helmet({
 
 // CORS configuration
 app.use(cors({
-  origin: config.frontendUrl,
+  origin: [
+    'http://localhost:5173',
+    'https://multi-workspace-ai-assistant.vercel.app'
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
@@ -95,19 +97,6 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/tools', toolRoutes);
 
-// =============================================
-// Serve static files in production
-// =============================================
-
-if (config.isProd) {
-  // Serve the frontend build
-  app.use(express.static(path.join(__dirname, '../../frontend/dist')));
-
-  // Handle SPA routing - serve index.html for all non-API routes
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
-  });
-}
 
 // =============================================
 // Error Handling
