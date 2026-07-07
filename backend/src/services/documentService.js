@@ -28,7 +28,6 @@ const config = require('../config');
  * @param {Buffer} fileBuffer - The uploaded file's contents in memory
  */
 const processDocument = async (document, fileBuffer) => {
-  console.log(`Extracted text length for ${document.id}:`, extracted.text?.length || 0);
   try {
     // Update document status to processing
     await query(
@@ -39,6 +38,7 @@ const processDocument = async (document, fileBuffer) => {
     // Step 1: Extract text based on file extension
     const ext = path.extname(document.original_filename || '').toLowerCase();
     const extracted = await extractText(fileBuffer, ext);
+    console.log(`Extracted text length for ${document.id}:`, extracted.text?.length || 0);
 
     // Step 2: Compute content hash (SHA-256 of extracted text) for deduplication
     let contentHash = null;
