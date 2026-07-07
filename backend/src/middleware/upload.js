@@ -2,51 +2,36 @@
 // File Upload Middleware
 // Configures multer for multiple document format uploads
 // Supported: PDF, DOCX, XLSX, CSV, TXT
+// Files are kept in memory only — never written to local disk —
+// since the deployment host's filesystem is ephemeral.
 // =============================================
 
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
-const { v4: uuidv4 } = require('uuid');
-
-// Ensure upload directory exists
-const uploadDir = path.resolve(__dirname, '../../uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
 
 /**
- * Multer storage configuration
- * Files are stored on disk with UUID-based filenames
+ * Multer memory storage — file buffer lives in req.file.buffer,
+ * never touches disk. Caller is responsible for persisting it
+ * (Supabase Storage) and/or parsing it directly from the buffer.
  */
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    // Generate unique filename to prevent collisions
-    const uniqueName = `${uuidv4()}-${Date.now()}${path.extname(file.originalname)}`;
-    cb(null, uniqueName);
-  },
-});
+const storage = multer.memoryStorage();
 
 /**
  * File filter to allow multiple document formats
  */
 const fileFilter = (req, file, cb) => {
   const allowedMimes = [
-    'application/pdf',                              // PDF
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // DOCX
-    'application/msword',                            // DOC
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // XLSX
-    'application/vnd.ms-excel',                      // XLS
-    'text/csv',                                      // CSV
-    'application/csv',                               // CSV (alt)
-    'text/plain',                                    // TXT
-    'text/tab-separated-values',                     // TSV
+    'application/pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-excel',
+    'text/csv',
+    'application/csv',
+    'text/plain',
+    'text/tab-separated-values',
   ];
 
-  // Also allow by extension as a fallback for missing/inconsistent mime types
   const allowedExtensions = ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.csv', '.txt', '.tsv'];
   const ext = path.extname(file.originalname).toLowerCase();
 
@@ -57,16 +42,12 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-/**
- * Configured multer instance
- * Max file size: 10MB (configurable via MAX_FILE_SIZE env)
- */
 const upload = multer({
   storage,
   fileFilter,
   limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE, 10) || 10485760, // 10MB
-    files: 1, // Maximum 1 file per upload
+    fileSize: parseInt(process.env.MAX_FILE_SIZE, 10) || 10485760,
+    files: 1,
   },
 });
 

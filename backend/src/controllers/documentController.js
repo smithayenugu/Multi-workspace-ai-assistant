@@ -4,12 +4,14 @@
 // =============================================
 
 const path = require('path');
-const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { query } = require('../models/db');
 const { processDocument, deleteDocumentChunks } = require('../services/documentService');
 const { ApiError } = require('../middleware/errorHandler');
+const { supabase } = require('../config/supabaseClient');
 const config = require('../config');
+
+const STORAGE_BUCKET = 'documents';
 
 /**
  * Upload a document
@@ -17,7 +19,7 @@ const config = require('../config');
  * Expects: multipart/form-data with file field
  */
 const uploadDocument = async (req, res) => {
-  const file = req.file;
+  const file = req.file; // multer memoryStorage -> file.buffer, no file.path
   const { workspaceId } = req.body;
 
   if (!file) {
@@ -35,26 +37,46 @@ const uploadDocument = async (req, res) => {
   );
 
   if (workspaceResult.rows.length === 0) {
-    // Clean up uploaded file
-    fs.unlinkSync(file.path);
+    // No local file to clean up anymore — buffer just gets garbage collected
     throw new ApiError(404, 'Workspace not found');
   }
 
-  // Create document record
+  // Build filenames / storage path
   const ext = path.extname(file.originalname) || '';
   const filename = `${uuidv4()}${ext}`;
-  const documentResult = await query(
-    `INSERT INTO documents (workspace_id, user_id, filename, original_filename, file_size, mime_type, status)
-     VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-     RETURNING *`,
-    [workspaceId, req.user.id, filename, file.originalname, file.size, file.mimetype]
-  );
+  const storagePath = `${workspaceId}/${filename}`;
 
-  const document = documentResult.rows[0];
+  // Upload the buffer to Supabase Storage
+  const { error: uploadError } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(storagePath, file.buffer, {
+      contentType: file.mimetype,
+      upsert: false,
+    });
+
+  if (uploadError) {
+    throw new ApiError(500, `Failed to store file: ${uploadError.message}`);
+  }
+
+  // Create document record — now saving storage_path instead of a local path
+  let document;
+  try {
+    const documentResult = await query(
+      `INSERT INTO documents (workspace_id, user_id, filename, original_filename, file_size, mime_type, status, storage_path)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+       RETURNING *`,
+      [workspaceId, req.user.id, filename, file.originalname, file.size, file.mimetype, storagePath]
+    );
+    document = documentResult.rows[0];
+  } catch (dbError) {
+    // DB insert failed — clean up the file we just uploaded to storage
+    await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]);
+    throw dbError;
+  }
 
   // Start document processing (async - don't await)
-  // This runs in the background while we return the response
-  processDocument(document, file.path).catch((err) => {
+  // Pass the in-memory buffer directly; processDocument no longer touches disk
+  processDocument(document, file.buffer).catch((err) => {
     console.error(`Background document processing failed for ${document.id}:`, err.message);
   });
 
@@ -75,7 +97,6 @@ const getDocuments = async (req, res) => {
     throw new ApiError(400, 'workspaceId query parameter is required');
   }
 
-  // Verify workspace ownership
   const workspaceResult = await query(
     'SELECT * FROM workspaces WHERE id = $1 AND user_id = $2',
     [workspaceId, req.user.id]
@@ -85,8 +106,6 @@ const getDocuments = async (req, res) => {
     throw new ApiError(404, 'Workspace not found');
   }
 
-  // Try the enhanced query with dedup info first; fall back to basic query
-  // if the migration hasn't been run yet (columns don't exist)
   let result;
   try {
     result = await query(
@@ -100,7 +119,6 @@ const getDocuments = async (req, res) => {
       [workspaceId]
     );
   } catch (err) {
-    // Fallback: columns don't exist yet (migration not run)
     result = await query(
       `SELECT d.*, 
               (SELECT COUNT(*) FROM document_chunks dc WHERE dc.document_id = d.id) as chunk_count
@@ -123,7 +141,6 @@ const getDocuments = async (req, res) => {
 const getDocument = async (req, res) => {
   const { id } = req.params;
 
-  // Try the enhanced query with dedup info first; fall back to basic query
   let result;
   try {
     result = await query(
@@ -136,7 +153,6 @@ const getDocument = async (req, res) => {
       [id, req.user.id]
     );
   } catch (err) {
-    // Fallback: columns don't exist yet (migration not run)
     result = await query(
       `SELECT d.*, 
               (SELECT COUNT(*) FROM document_chunks dc WHERE dc.document_id = d.id) as chunk_count
@@ -172,8 +188,23 @@ const deleteDocument = async (req, res) => {
     throw new ApiError(404, 'Document not found');
   }
 
+  const document = existing.rows[0];
+
   // Delete chunks first
   await deleteDocumentChunks(id);
+
+  // Delete the stored file from Supabase Storage (if it has one)
+  if (document.storage_path) {
+    const { error: removeError } = await supabase.storage
+      .from(STORAGE_BUCKET)
+      .remove([document.storage_path]);
+
+    if (removeError) {
+      // Don't block deletion of the DB record over a storage cleanup failure —
+      // just log it so it can be cleaned up manually later if needed
+      console.warn(`Failed to remove storage file for document ${id}:`, removeError.message);
+    }
+  }
 
   // Delete document record (CASCADE will handle remaining chunks)
   await query('DELETE FROM documents WHERE id = $1 AND user_id = $2', [id, req.user.id]);
@@ -190,7 +221,6 @@ const deleteDocument = async (req, res) => {
 const getDocumentStatus = async (req, res) => {
   const { id } = req.params;
 
-  // Try the enhanced query with dedup columns first; fall back to basic query
   let result;
   try {
     result = await query(
@@ -198,7 +228,6 @@ const getDocumentStatus = async (req, res) => {
       [id, req.user.id]
     );
   } catch (err) {
-    // Fallback: columns don't exist yet (migration not run)
     result = await query(
       'SELECT id, status, error_message, page_count, created_at, updated_at FROM documents WHERE id = $1 AND user_id = $2',
       [id, req.user.id]

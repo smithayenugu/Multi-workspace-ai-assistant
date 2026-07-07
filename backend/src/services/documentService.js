@@ -25,9 +25,10 @@ const config = require('../config');
  * 4. Store chunks in the vector database
  * 
  * @param {Object} document - Document record from database
- * @param {string} filePath - Path to the uploaded file
+ * @param {Buffer} fileBuffer - The uploaded file's contents in memory
  */
-const processDocument = async (document, filePath) => {
+const processDocument = async (document, fileBuffer) => {
+  console.log(`Extracted text length for ${document.id}:`, extracted.text?.length || 0);
   try {
     // Update document status to processing
     await query(
@@ -37,16 +38,14 @@ const processDocument = async (document, filePath) => {
 
     // Step 1: Extract text based on file extension
     const ext = path.extname(document.original_filename || '').toLowerCase();
-    const extracted = await extractText(filePath, ext);
-    
+    const extracted = await extractText(fileBuffer, ext);
+
     // Step 2: Compute content hash (SHA-256 of extracted text) for deduplication
-    // Try using the content_hash/duplicate_of columns; if migration hasn't run, skip dedup
     let contentHash = null;
     let dedupEnabled = false;
     try {
       contentHash = crypto.createHash('sha256').update(extracted.text, 'utf-8').digest('hex');
-      
-      // Check if a processed document with the same content_hash exists in this workspace
+
       const existingDoc = await query(
         `SELECT id FROM documents 
          WHERE workspace_id = $1 AND content_hash = $2 AND status = 'processed'
@@ -55,8 +54,6 @@ const processDocument = async (document, filePath) => {
       );
 
       if (existingDoc.rows.length > 0) {
-        // Duplicate found — mark this upload as 'duplicate', reference the existing doc
-        // Do NOT set content_hash on the duplicate (unique index would conflict with original)
         await query(
           `UPDATE documents 
            SET status = 'duplicate', duplicate_of = $1, updated_at = NOW() 
@@ -66,15 +63,11 @@ const processDocument = async (document, filePath) => {
 
         console.log(`Document ${document.id} is a duplicate of ${existingDoc.rows[0].id}. Skipping chunking.`);
 
-        // Clean up: delete uploaded file
-        try { fs.unlinkSync(filePath); } catch (e) { /* ignore */ }
-
-        return; // Skip chunking/embedding entirely
+        return; 
       }
 
       dedupEnabled = true;
     } catch (dedupError) {
-      // Dedup columns don't exist yet (migration not run) — proceed with normal processing
       console.log(`Dedup skipped for document ${document.id} (columns not yet available): ${dedupError.message}`);
     }
 
@@ -118,23 +111,20 @@ const processDocument = async (document, filePath) => {
       ['processed', document.id]
     );
 
-    // Clean up: delete uploaded file after processing
-    try {
-      fs.unlinkSync(filePath);
-    } catch (cleanupError) {
-      console.warn('Failed to clean up uploaded file:', cleanupError.message);
-    }
+    // No cleanup step needed here anymore — there is no local file to delete.
+    // The original file (if you're keeping it for later viewing) already lives
+    // in Supabase Storage, uploaded by the route handler before this function
+    // was called. This function only ever worked with the in-memory buffer.
 
     console.log(`Document ${document.id} processed successfully with ${chunks.length} chunks`);
   } catch (error) {
     console.error('Document processing error:', error.message);
-    
-    // Update document status to failed
+
     await query(
       'UPDATE documents SET status = $1, error_message = $2, updated_at = NOW() WHERE id = $3',
       ['failed', error.message, document.id]
     );
-    
+
     throw error;
   }
 };
@@ -145,34 +135,30 @@ const processDocument = async (document, filePath) => {
  * @param {string} ext - File extension (e.g. .pdf, .docx, .xlsx, .csv, .txt)
  * @returns {Promise<Object>} - Extracted text and metadata
  */
-const extractText = async (filePath, ext) => {
+// extractText now takes a buffer instead of a filePath
+const extractText = async (fileBuffer, ext) => {
   switch (ext) {
     case '.pdf':
-      return await extractTextFromPDF(filePath);
+      return await extractTextFromPDF(fileBuffer);
     case '.docx':
     case '.doc':
-      return await extractTextFromDocx(filePath);
+      return await extractTextFromDocx(fileBuffer);
     case '.xlsx':
     case '.xls':
-      return await extractTextFromXlsx(filePath);
+      return await extractTextFromXlsx(fileBuffer);
     case '.csv':
     case '.tsv':
-      return await extractTextFromCsv(filePath, ext === '.tsv');
+      return await extractTextFromCsv(fileBuffer, ext === '.tsv');
     case '.txt':
-      return await extractTextFromTxt(filePath);
+      return await extractTextFromTxt(fileBuffer);
     default:
       throw new ApiError(400, `Unsupported file format: ${ext}`);
   }
 };
 
-/**
- * Extract text from a PDF file
- */
-const extractTextFromPDF = async (filePath) => {
+const extractTextFromPDF = async (fileBuffer) => {
   try {
-    const dataBuffer = fs.readFileSync(filePath);
-    const data = await pdfParse(dataBuffer);
-    
+    const data = await pdfParse(fileBuffer); // pdf-parse already accepts a buffer directly
     return {
       text: data.text,
       pageCount: data.numpages,
@@ -187,59 +173,35 @@ const extractTextFromPDF = async (filePath) => {
   }
 };
 
-/**
- * Extract text from a DOCX/DOC file using mammoth
- */
-const extractTextFromDocx = async (filePath) => {
+const extractTextFromDocx = async (fileBuffer) => {
   try {
-    const result = await mammoth.extractRawText({ path: filePath });
-    return {
-      text: result.value || '',
-      pageCount: null,
-      metadata: {},
-    };
+    const result = await mammoth.extractRawText({ buffer: fileBuffer }); // buffer, not path
+    return { text: result.value || '', pageCount: null, metadata: {} };
   } catch (error) {
     throw new ApiError(500, `Failed to extract text from Word document: ${error.message}`);
   }
 };
 
-/**
- * Extract text from an XLSX/XLS file using xlsx
- */
-const extractTextFromXlsx = async (filePath) => {
+const extractTextFromXlsx = async (fileBuffer) => {
   try {
-    const workbook = XLSX.readFile(filePath, { type: 'file' });
+    const workbook = XLSX.read(fileBuffer, { type: 'buffer' }); // buffer, not readFile(path)
     let text = '';
-
     workbook.SheetNames.forEach((sheetName) => {
       const sheet = workbook.Sheets[sheetName];
-      // Convert sheet to CSV-like text with rows and columns
       const sheetText = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
       if (sheetText.trim()) {
         text += `\n--- Sheet: ${sheetName} ---\n${sheetText}\n`;
       }
     });
-
-    return {
-      text: text.trim(),
-      pageCount: null,
-      metadata: {
-        sheets: workbook.SheetNames,
-      },
-    };
+    return { text: text.trim(), pageCount: null, metadata: { sheets: workbook.SheetNames } };
   } catch (error) {
     throw new ApiError(500, `Failed to extract text from Excel file: ${error.message}`);
   }
 };
 
-/**
- * Extract text from a CSV/TSV file
- * Each row is prefixed with column headers so every chunk is self-contained
- * Auto-detects delimiter (comma, semicolon, tab)
- */
-const extractTextFromCsv = async (filePath, isTsv = false) => {
+const extractTextFromCsv = async (fileBuffer, isTsv = false) => {
   try {
-    const fileContent = fs.readFileSync(filePath, 'utf-8');
+    const fileContent = fileBuffer.toString('utf-8'); 
     
     // Auto-detect delimiter: check first line for semicolons vs commas
     const firstLine = fileContent.split('\n')[0] || '';
@@ -314,14 +276,10 @@ const extractTextFromCsv = async (filePath, isTsv = false) => {
 /**
  * Extract text from a plain text file
  */
-const extractTextFromTxt = async (filePath) => {
+const extractTextFromTxt = async (fileBuffer) => {
   try {
-    const text = fs.readFileSync(filePath, 'utf-8');
-    return {
-      text,
-      pageCount: null,
-      metadata: {},
-    };
+    const text = fileBuffer.toString('utf-8');
+    return { text, pageCount: null, metadata: {} };
   } catch (error) {
     throw new ApiError(500, `Failed to read text file: ${error.message}`);
   }
@@ -532,6 +490,7 @@ const deleteDocumentChunks = async (documentId) => {
   await query('DELETE FROM document_chunks WHERE document_id = $1', [documentId]);
 };
 
+const { supabase } = require('../config/supabaseClient');
 /**
  * Recover documents stuck in 'processing' status.
  * On server startup, reset any documents that have been in 'processing'
@@ -539,15 +498,24 @@ const deleteDocumentChunks = async (documentId) => {
  * If the original file no longer exists on disk, marks the document as 'failed'.
  * @returns {Promise<number>} Number of documents recovered
  */
+
+
+/**
+ * Recover documents stuck in 'processing' status.
+ * On server startup, reset any documents that have been in 'processing'
+ * for more than 5 minutes back to 'pending' and re-trigger processing.
+ * Since files now live in Supabase Storage (not local disk), recovery
+ * means re-downloading the file's bytes from storage using storage_path.
+ * @returns {Promise<number>} Number of documents recovered
+ */
 const recoverStuckDocuments = async () => {
   try {
-    // Find stuck documents with full record
     const stuckDocs = await query(
       `SELECT * FROM documents 
        WHERE status = 'processing' 
          AND updated_at < NOW() - INTERVAL '5 minutes'`
     );
-    
+
     if (stuckDocs.rows.length === 0) {
       return 0;
     }
@@ -555,38 +523,55 @@ const recoverStuckDocuments = async () => {
     console.log(`Found ${stuckDocs.rows.length} stuck document(s) to recover.`);
 
     for (const doc of stuckDocs.rows) {
-      // The uploaded file is stored in the temp uploads directory by multer
-      // After a server restart, these temp files are typically gone
-      // Check the configured upload directory
-      const uploadsDir = config.uploadDir || path.join(__dirname, '../../uploads');
-      const filePath = path.join(uploadsDir, doc.filename);
-
-      if (fs.existsSync(filePath)) {
-        // File still exists — reset to pending and re-trigger processing
+      if (!doc.storage_path) {
+        // Old-style document from before the Supabase migration, or the
+        // storage path was never saved — nothing to recover from.
         await query(
           `UPDATE documents 
-           SET status = 'pending', error_message = 'Recovered from stuck processing state after server restart', updated_at = NOW()
+           SET status = 'failed', error_message = 'No storage path on record, please re-upload', updated_at = NOW()
            WHERE id = $1`,
           [doc.id]
         );
-        console.log(`Re-triggering processing for recovered document ${doc.id}`);
-        
-        // Re-trigger processing asynchronously with the full document record
-        processDocument(doc, filePath).catch((err) => {
-          console.error(`Re-processing failed for recovered document ${doc.id}:`, err.message);
-        });
-      } else {
-        // File no longer available — mark as failed
-        await query(
-          `UPDATE documents 
-           SET status = 'failed', error_message = 'File no longer available after server restart, please re-upload', updated_at = NOW()
-           WHERE id = $1`,
-          [doc.id]
-        );
-        console.log(`Marked document ${doc.id} as failed — file not found on disk.`);
+        console.log(`Marked document ${doc.id} as failed — no storage_path on record.`);
+        continue;
       }
+
+      // Try to re-download the file's bytes from Supabase Storage
+      const { data, error } = await supabase.storage
+        .from('documents')
+        .download(doc.storage_path);
+
+      if (error || !data) {
+        // File genuinely missing from storage — mark as failed
+        await query(
+          `UPDATE documents 
+           SET status = 'failed', error_message = 'File no longer available in storage, please re-upload', updated_at = NOW()
+           WHERE id = $1`,
+          [doc.id]
+        );
+        console.log(`Marked document ${doc.id} as failed — file not found in storage.`);
+        continue;
+      }
+
+      // Supabase's download() returns a Blob — convert it to a Buffer
+      // so it matches what processDocument expects everywhere else
+      const arrayBuffer = await data.arrayBuffer();
+      const fileBuffer = Buffer.from(arrayBuffer);
+
+      // File is safe — reset to pending and re-trigger processing
+      await query(
+        `UPDATE documents 
+         SET status = 'pending', error_message = 'Recovered from stuck processing state after server restart', updated_at = NOW()
+         WHERE id = $1`,
+        [doc.id]
+      );
+      console.log(`Re-triggering processing for recovered document ${doc.id}`);
+
+      processDocument(doc, fileBuffer).catch((err) => {
+        console.error(`Re-processing failed for recovered document ${doc.id}:`, err.message);
+      });
     }
-    
+
     return stuckDocs.rows.length;
   } catch (error) {
     console.error('Failed to recover stuck documents:', error.message);
